@@ -93,11 +93,12 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             logger.info("Transcription completed: %s", transcript)
 
         if self.runtime_config is not None:
-            self.runtime_config.chat.add_item(make_user_message(transcript))
+            item = self.runtime_config.chat.add_item(make_user_message(transcript))
             yield GenerateResponseRequest(
                 runtime_config=self.runtime_config,
                 language_code=language_code,
                 turn_id=turn_id,
                 turn_revision=turn_revision,
                 speech_stopped_at_s=speech_stopped_at_s,
+                user_chat_item_id=item.id,
             )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterator
+import re
+import torch
+from typing import Any, Iterator, Optional
 
 import numpy as np
-import torch
 from rich.console import Console
 
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
@@ -18,11 +19,15 @@ logger = logging.getLogger(__name__)
 
 console = Console()
 
+# Matches SenseVoice output tokens like <|ja|>, <|NEUTRAL|>, <|Speech|>, <|withitn|>
+_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]+\|>")
+
 
 class ParaformerSTTHandler(BaseSTTHandler):
     """
-    Handles the Speech To Text generation using a Paraformer model.
-    The default for this model is set to Chinese.
+    Handles the Speech To Text generation using a Paraformer or SenseVoice model.
+    The default for this model is set to Chinese (paraformer-zh).
+    For Japanese with live transcription support, use FunAudioLLM/SenseVoiceSmall with hub='hf'.
     This model was contributed by @wuhongsheng.
     """
 
@@ -30,12 +35,13 @@ class ParaformerSTTHandler(BaseSTTHandler):
         self,
         model_name: str = "paraformer-zh",
         device: str = "cuda",
+        language: Optional[str] = None,
+        hub: Optional[str] = None,
         gen_kwargs: dict[str, Any] = {},
     ) -> None:
-        print(model_name)
-        if len(model_name.split("/")) > 1:
-            model_name = model_name.split("/")[-1]
         self.device = device
+        self.language = language
+        self.gen_kwargs = gen_kwargs
         try:
             from funasr import AutoModel
         except ModuleNotFoundError as exc:
@@ -43,23 +49,35 @@ class ParaformerSTTHandler(BaseSTTHandler):
                 "Paraformer STT requires the optional 'paraformer' extra. "
                 "Install it with `pip install speech-to-speech[paraformer]`."
             ) from exc
-        self.model = AutoModel(model=model_name, device=device)
+
+        model_kwargs: dict[str, Any] = {"model": model_name, "device": device, "disable_update": True}
+        if hub:
+            model_kwargs["hub"] = hub
+
+        logger.info(f"Loading Paraformer/SenseVoice model: {model_name} (hub={hub}, language={language})")
+        self.model = AutoModel(**model_kwargs)
         self.warmup()
+
+    def _generate(self, audio: np.ndarray) -> str:
+        kwargs: dict[str, Any] = {**self.gen_kwargs}
+        if self.language:
+            kwargs["language"] = self.language
+            kwargs["use_itn"] = True
+        raw = self.model.generate(audio, **kwargs)[0]["text"]
+        # Strip SenseVoice special tokens (no-op for plain Paraformer output)
+        return _SENSEVOICE_TAG_RE.sub("", raw).strip().replace(" ", "")
 
     def warmup(self) -> None:
         logger.info(f"Warming up {self.__class__.__name__}")
-
-        # 2 warmup steps for no compile or compile mode with CUDA graphs capture
-        n_steps = 1
-        dummy_input = np.array([0] * 512, dtype=np.float32)
-        for _ in range(n_steps):
-            _ = self.model.generate(dummy_input)[0]["text"].strip().replace(" ", "")
+        dummy_input = np.zeros(16000, dtype=np.float32)
+        _ = self._generate(dummy_input)
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         logger.debug("infering paraformer...")
 
-        pred_text = self.model.generate(vad_audio.audio)[0]["text"].strip().replace(" ", "")
-        torch.mps.empty_cache()
+        pred_text = self._generate(vad_audio.audio)
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
         logger.debug("finished paraformer inference")
         console.print(f"[yellow]USER: {pred_text}")

@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import httpx
 from nltk import sent_tokenize
-from openai import OpenAI, Stream
+from openai import BadRequestError, OpenAI, Stream
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCall,
@@ -41,6 +41,25 @@ from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
+
+# Keywords that indicate the user is asking a visual question.
+# When detected and tools are available, tool_choice is forced to "required"
+# because gemma-3-4b-it with tool_choice="auto" tends to refuse tool calls
+# for physical-world interactions.
+_VISUAL_KEYWORDS = frozenset([
+    # Japanese
+    "色", "見え", "見て", "カメラ", "画像", "写真", "映", "形", "文字",
+    "場所", "どこ", "何が", "誰が", "何色", "何の", "見た", "見せ",
+    # English
+    "color", "colour", "see", "camera", "image", "photo", "picture",
+    "look", "shape", "text", "where", "what is",
+])
+
+
+def _is_visual_question(text: str) -> bool:
+    """Return True if the text appears to be asking about something visual."""
+    lower = text.lower()
+    return any(kw in lower for kw in _VISUAL_KEYWORDS)
 
 
 class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
@@ -80,6 +99,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         )
 
         self.user_role = user_role
+        self._default_instructions: str = _kwargs.get("init_chat_prompt", "") or ""
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self._extra_body = (
             {"chat_template_kwargs": {"enable_thinking": False}}
@@ -168,6 +188,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         turn_id: str | None,
         turn_revision: int | None,
         speech_stopped_at_s: float | None,
+        user_chat_item_id: str | None = None,
     ) -> Iterator[LLMOut]:
         api_response: Response | Stream[ResponseStreamEvent] | None = None
         tools: list[ResponseFunctionToolCall] = []
@@ -176,9 +197,15 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         input_tokens = 0
         output_tokens = 0
         try:
+            chat_input = active_chat.to_responses_api_chat()
+            logger.debug("LLM request: input_len=%d tool_choice=%s tools=%s",
+                         len(chat_input),
+                         optional_kwargs.get("tool_choice"),
+                         [getattr(t, "name", t.get("name") if isinstance(t, dict) else "?")
+                          for t in optional_kwargs.get("tools", [])])
             api_response = self.client.responses.create(
                 model=self.model_name,
-                input=active_chat.to_responses_api_chat(),
+                input=chat_input,
                 stream=self.stream,
                 extra_body=self._extra_body,
                 timeout=self.request_timeout,
@@ -355,6 +382,23 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
                     speech_stopped_at_s=speech_stopped_at_s,
                     cancel_generation=gen,
                 )
+        except BadRequestError as exc:
+            # Some backends (e.g. vLLM) require strict user/assistant alternation.
+            # When the previous LLM call failed, the user message was left in the chat
+            # without a paired assistant response, causing every subsequent call to fail.
+            # Roll back the orphaned user message so the next turn starts from a valid state.
+            if "alternate" in str(exc).lower():
+                if user_chat_item_id:
+                    original_chat.remove_user_message(user_chat_item_id)
+                else:
+                    original_chat.remove_last_user_message()
+                logger.warning(
+                    "LLM rejected request due to role alternation violation; "
+                    "rolled back user message (item_id=%s) to restore chat state",
+                    user_chat_item_id,
+                )
+            else:
+                logger.error("LLM returned 400 Bad Request: %s", exc)
         finally:
             if api_response is not None and hasattr(api_response, "close"):
                 try:
@@ -401,7 +445,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
         language_code = request.language_code
         instructions = (
             response.instructions if response and response.instructions else runtime_config.session.instructions
-        ) or ""
+        ) or self._default_instructions
         req_tools = response.tools if response and response.tools else runtime_config.session.tools
         req_tool_choice = (
             response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
@@ -413,9 +457,27 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
 
         optional_kwargs: dict[str, Any] = {}
         if req_tools is not None:
-            optional_kwargs["tools"] = req_tools
-        if req_tool_choice is not None:
-            optional_kwargs["tool_choice"] = req_tool_choice
+            effective_tools = req_tools
+            effective_tool_choice = req_tool_choice if req_tool_choice is not None else "auto"
+            # gemma-3-4b-it refuses tool calls for "physical world" questions with
+            # tool_choice="auto". When a visual question is detected, narrow the tool
+            # list to just "camera" and force tool_choice="required" so the model is
+            # guaranteed to call it.  Narrowing to one tool avoids the multi-tool
+            # selection overhead that causes timeouts with 9 tools.
+            if (
+                effective_tool_choice == "auto"
+                and req_tools
+                and _is_visual_question(active_chat.get_last_user_message_text() or "")
+                and not active_chat.has_tool_output_after_last_user()
+            ):
+                camera_tools = [t for t in req_tools if getattr(t, "name", None) == "camera"
+                                or (isinstance(t, dict) and t.get("name") == "camera")]
+                if camera_tools:
+                    effective_tools = camera_tools
+                    effective_tool_choice = "required"
+                    logger.debug("Visual question detected — narrowing to camera tool, tool_choice='required'")
+            optional_kwargs["tools"] = effective_tools
+            optional_kwargs["tool_choice"] = effective_tool_choice
 
         # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
         # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
@@ -435,6 +497,7 @@ class ResponsesApiModelHandler(BaseHandler[LLMIn, LLMOut]):
             turn_id,
             turn_revision,
             speech_stopped_at_s,
+            user_chat_item_id=request.user_chat_item_id,
         )
 
     def on_session_end(self) -> None:

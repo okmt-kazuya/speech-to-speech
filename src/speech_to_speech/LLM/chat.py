@@ -282,6 +282,45 @@ class Chat:
                 return True
         return False
 
+    def remove_last_user_message(self) -> bool:
+        """Remove the most recent user message from the buffer.
+
+        Used as a fallback rollback when the LLM rejects the request and
+        the caller doesn't have the item ID (e.g. realtime path).
+        """
+        with self._lock:
+            for index in range(len(self.buffer) - 1, -1, -1):
+                if isinstance(self.buffer[index], RealtimeConversationItemUserMessage):
+                    del self.buffer[index]
+                    self._user_turn_count -= 1
+                    logger.debug("Removed last user message from chat (rollback)")
+                    return True
+        return False
+
+    def get_last_user_message_text(self) -> str | None:
+        """Return the text of the most recent user message, or None."""
+        with self._lock:
+            for item in reversed(self.buffer):
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    for part in item.content or []:
+                        if hasattr(part, "text") and part.text:
+                            return part.text
+        return None
+
+    def has_tool_output_after_last_user(self) -> bool:
+        """Return True if there is a function_call_output after the last user message.
+
+        Used to detect the "generate response to tool result" phase so the LLM handler
+        can avoid re-forcing tool_choice="required" when a camera result is already present.
+        """
+        with self._lock:
+            for item in reversed(self.buffer):
+                if isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    return True
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    return False
+            return False
+
     def to_responses_api_chat(self, items: list[SupportedItem] | None = None) -> ResponseInputParam:
         """Serialize the chat (system prompt + buffer) for the OpenAI Responses API.
 
@@ -338,30 +377,36 @@ class Chat:
                         )
                     )
             elif isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id is not None:
-                assert item.call_id is not None and item.call_id != ""
-                function_call = ResponseFunctionToolCallParam(
-                    arguments=item.arguments,
-                    call_id=item.call_id,
-                    name=item.name,
-                    type="function_call",
-                    id=item.id,
+                # Gemma's chat template only supports user/assistant alternation and
+                # rejects function_call/function_call_output roles.  Convert the
+                # function call to an empty assistant turn so alternation is preserved
+                # when the subsequent tool result arrives as a user message.
+                result.append(
+                    ResponseOutputMessageParam(
+                        id=item.id or _generate_id("msg"),
+                        content=[ResponseOutputTextParam(text="...", type="output_text", annotations=[])],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
                 )
-                if item.id is not None:
-                    function_call["id"] = item.id
-                if item.status is not None:
-                    function_call["status"] = item.status
-                result.append(function_call)
             elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
-                function_call_output = FunctionCallOutput(
-                    call_id=item.call_id,
-                    output=item.output,
-                    type="function_call_output",
+                # Convert the tool result to a plain user message so Gemma can read it.
+                # Format it explicitly so the model understands it is a tool result, not user speech.
+                output_text = item.output or ""
+                try:
+                    data = json.loads(output_text)
+                    if isinstance(data, dict) and "image_description" in data:
+                        output_text = f"[カメラの結果: {data['image_description']}]"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                result.append(
+                    ResponseMessage(
+                        content=[ResponseInputTextParam(text=output_text, type="input_text")],
+                        role="user",
+                        type="message",
+                    )
                 )
-                if item.id is not None:
-                    function_call_output["id"] = item.id
-                if item.status is not None:
-                    function_call_output["status"] = item.status
-                result.append(function_call_output)
         return result
 
     def to_transformers_chat(self) -> list[dict[str, Any]]:

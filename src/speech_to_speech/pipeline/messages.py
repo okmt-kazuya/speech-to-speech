@@ -153,6 +153,7 @@ class GenerateResponseRequest(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    user_chat_item_id: str | None = None
 
 
 # ── Binary sentinels (audio/output queue) ─────────────────────────────
